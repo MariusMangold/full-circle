@@ -42,13 +42,22 @@ def test_start_node_matches_normalised_street_name():
     assert name == "Main Street"
 
 
-def test_euler_route_coordinates_include_edge_geometry():
+def test_fast_euler_route_is_closed_and_includes_edge_geometry():
     graph = sample_graph()
-    euler = nx.eulerize(graph)
+    euler = route_engine._fast_eulerize(graph)
+    assert nx.is_eulerian(euler)
+    assert euler.number_of_edges() >= graph.number_of_edges()
     circuit = list(nx.eulerian_circuit(euler, source=1, keys=True))
     coordinates = route_engine._route_coordinates(euler, circuit)
     assert coordinates[0] == coordinates[-1]
     assert len(coordinates) >= len(circuit)
+
+
+def test_fast_euler_route_preserves_every_original_edge():
+    graph = sample_graph()
+    euler = route_engine._fast_eulerize(graph)
+    for u, v, key in graph.edges(keys=True):
+        assert euler.has_edge(u, v, key)
 
 
 def test_result_cache_round_trip(tmp_path: Path):
@@ -70,3 +79,7 @@ def test_result_cache_round_trip(tmp_path: Path):
     assert loaded is not None
     assert loaded.place == result.place
     assert loaded.from_cache is True
+
+
+def test_identical_requests_share_one_lock():
+    assert route_engine._request_lock("same-key") is route_engine._request_lock("same-key")

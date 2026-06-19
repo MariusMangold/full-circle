@@ -4,6 +4,12 @@ A Streamlit web app that downloads a walkable OpenStreetMap network, creates a
 closed route covering every street in its main connected component, displays it
 on an interactive map, and exports it as GPX.
 
+The route engine uses fast global-greedy pairing of odd junctions. This preserves the
+important guarantee—every retained street segment is included in one closed
+route—while avoiding the very expensive global matching used by NetworkX's
+default Eulerisation. The repeated distance is therefore kept reasonably low but
+is not guaranteed to be the mathematical minimum.
+
 ## Run locally
 
 Python 3.12 is recommended.

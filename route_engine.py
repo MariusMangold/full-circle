@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,9 @@ MAX_AREA_KM2 = int(os.environ.get("MAX_AREA_KM2", "250"))
 MAX_NODES = int(os.environ.get("MAX_NODES", "12000"))
 MAX_EDGES = int(os.environ.get("MAX_EDGES", "30000"))
 MAX_ODD_NODES = int(os.environ.get("MAX_ODD_NODES", "1200"))
+
+_REQUEST_LOCKS: dict[str, threading.Lock] = {}
+_REQUEST_LOCKS_GUARD = threading.Lock()
 
 ProgressCallback = Callable[[str], None]
 
@@ -310,28 +314,86 @@ def _edge_length(data: dict, fallback: float = 0.0) -> float:
         return fallback
 
 
-def generate_route(
+def _request_lock(cache_key: str) -> threading.Lock:
+    """Return one process-local lock per route request.
+
+    Streamlit serves multiple sessions in one process. Without this guard, two
+    friends clicking the same uncached city can start the same expensive job.
+    """
+    with _REQUEST_LOCKS_GUARD:
+        return _REQUEST_LOCKS.setdefault(cache_key, threading.Lock())
+
+
+def _fast_eulerize(graph, callback: ProgressCallback | None = None):
+    """Make a connected graph Eulerian using global-greedy odd-node pairing.
+
+    NetworkX's :func:`eulerize` builds a complete graph of all odd junctions and
+    solves a global matching problem. That produces a good pairing but becomes
+    painfully slow on street networks. Here all odd-junction distances are
+    measured, then the shortest available pair is repeatedly selected. Every
+    original edge is still covered and the result is still a closed Euler
+    circuit; the repeated portion is usually compact but not globally minimal.
+    """
+    odd_nodes = sorted((node for node, degree in graph.degree() if degree % 2), key=str)
+    if not odd_nodes:
+        return graph.copy()
+
+    euler_graph = nx.MultiGraph(graph)
+    total_pairs = len(odd_nodes) // 2
+    candidate_pairs: list[tuple[float, str, str, int, int]] = []
+    report_every = max(1, len(odd_nodes) // 10)
+
+    # Retain only distances between odd nodes, not a dense paths dictionary.
+    # This keeps memory bounded while avoiding NetworkX's cubic global matcher.
+    for index, source in enumerate(odd_nodes[:-1]):
+        try:
+            distances = nx.single_source_dijkstra_path_length(graph, source, weight="length")
+        except nx.NetworkXError as exc:
+            raise RouteError(f"Could not measure distances between odd junctions: {exc}") from exc
+        for target in odd_nodes[index + 1:]:
+            if target in distances:
+                candidate_pairs.append((distances[target], str(source), str(target), source, target))
+        if index % report_every == 0:
+            percent = max(1, int((index + 1) * 100 / (len(odd_nodes) - 1)))
+            _notify(callback, f"Measuring junction connections… {percent}%")
+
+    candidate_pairs.sort()
+    unmatched = set(odd_nodes)
+    pairings: list[tuple[int, int]] = []
+    for _distance, _source_order, _target_order, source, target in candidate_pairs:
+        if source in unmatched and target in unmatched:
+            unmatched.remove(source)
+            unmatched.remove(target)
+            pairings.append((source, target))
+            if not unmatched:
+                break
+    if unmatched:
+        raise RouteError("Some street junctions could not be paired into a closed route.")
+
+    for completed_pairs, (source, target) in enumerate(pairings, 1):
+        path = nx.shortest_path(graph, source, target, weight="length")
+        for u, v in zip(path, path[1:]):
+            options = graph.get_edge_data(u, v)
+            if not options:
+                raise RouteError("A shortest-path street segment disappeared during route generation.")
+            _key, data = min(options.items(), key=lambda item: _edge_length(item[1], 1.0))
+            euler_graph.add_edge(u, v, **data.copy())
+        percent = max(1, int(completed_pairs * 100 / total_pairs))
+        if completed_pairs == 1 or completed_pairs % max(1, total_pairs // 10) == 0:
+            _notify(callback, f"Adding shortest connections… {percent}%")
+
+    if not nx.is_eulerian(euler_graph):
+        raise RouteError("The augmented street network is unexpectedly not Eulerian.")
+    return euler_graph
+
+
+def _generate_uncached_route(
     place: str,
-    start_street: str = "",
-    *,
-    cache_dir: Path | str = DEFAULT_CACHE_DIR,
-    progress: ProgressCallback | None = None,
+    start_street: str,
+    cache_dir: Path,
+    result_path: Path,
+    progress: ProgressCallback | None,
 ) -> RouteResult:
-    """Create a closed walk covering every edge in the main connected network."""
-    place = " ".join(place.split())
-    start_street = " ".join(start_street.split())
-    if len(place) < 3 or len(place) > 160:
-        raise RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
-    if len(start_street) > 120:
-        raise RouteError("The starting street name is too long.")
-
-    cache_dir = Path(cache_dir)
-    result_path = cache_dir / "routes" / f"{_cache_key(place, start_street)}.pkl"
-    cached = _load_result(result_path)
-    if cached:
-        _notify(progress, "Loaded the finished route from cache.")
-        return cached
-
     raw_graph = _download_graph(place, cache_dir, progress)
     graph = _prepare_graph(raw_graph, progress)
     if graph.number_of_nodes() > MAX_NODES or graph.number_of_edges() > MAX_EDGES:
@@ -341,15 +403,12 @@ def generate_route(
     odd_nodes = sum(1 for _, degree in graph.degree() if degree % 2)
     if odd_nodes > MAX_ODD_NODES:
         raise RouteTooLargeError(
-            f"This network has {odd_nodes:,} odd junctions, making the exact route too expensive. "
+            f"This network has {odd_nodes:,} odd junctions, making the route too expensive. "
             "Try a smaller district."
         )
 
-    _notify(progress, "Connecting dead ends and odd junctions…")
-    try:
-        euler_graph = nx.eulerize(graph)
-    except Exception as exc:
-        raise RouteError(f"The street network could not be converted into one closed route: {exc}") from exc
+    _notify(progress, f"Connecting {odd_nodes:,} odd junctions into a closed route…")
+    euler_graph = _fast_eulerize(graph, progress)
 
     _notify(progress, "Calculating the complete turn-by-turn circuit…")
     circuit = list(nx.eulerian_circuit(euler_graph, source=start_node, keys=True))
@@ -360,8 +419,6 @@ def generate_route(
     coordinates = _route_coordinates(euler_graph, circuit)
     route_metres = sum(_edge_length(euler_graph.get_edge_data(u, v, key) or {}) for u, v, key in circuit)
     street_metres = sum(_edge_length(data) for *_edge, data in graph.edges(keys=True, data=True))
-    # An undirected OSMnx graph can retain paired directional edges. Report the
-    # graph sum consistently; the route figure remains the useful comparison.
     result = RouteResult(
         place=place,
         requested_start=start_street,
@@ -379,3 +436,38 @@ def generate_route(
     except OSError:
         pass
     return result
+
+
+def generate_route(
+    place: str,
+    start_street: str = "",
+    *,
+    cache_dir: Path | str = DEFAULT_CACHE_DIR,
+    progress: ProgressCallback | None = None,
+) -> RouteResult:
+    """Create a closed walk covering every edge in the main connected network."""
+    place = " ".join(place.split())
+    start_street = " ".join(start_street.split())
+    if len(place) < 3 or len(place) > 160:
+        raise RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
+    if len(start_street) > 120:
+        raise RouteError("The starting street name is too long.")
+
+    cache_dir = Path(cache_dir)
+    key = _cache_key(place, start_street)
+    result_path = cache_dir / "routes" / f"{key}.pkl"
+    cached = _load_result(result_path)
+    if cached:
+        _notify(progress, "Loaded the finished route from cache.")
+        return cached
+
+    lock = _request_lock(key)
+    if lock.locked():
+        _notify(progress, "Another visitor is already calculating this route; waiting for its cache…")
+    with lock:
+        # A previous waiter may have completed the route while this request was blocked.
+        cached = _load_result(result_path)
+        if cached:
+            _notify(progress, "Loaded the finished route from cache.")
+            return cached
+        return _generate_uncached_route(place, start_street, cache_dir, result_path, progress)

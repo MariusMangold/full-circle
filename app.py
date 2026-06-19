@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import folium
 import streamlit as st
 import streamlit.components.v1 as components
@@ -102,17 +104,23 @@ if submitted:
         st.warning("Enter a city, municipality, or district.")
     else:
         messages: list[str] = []
+        started_at = time.perf_counter()
         with st.status("Starting route generation…", expanded=True) as status:
             def progress(message: str) -> None:
                 if not messages or messages[-1] != message:
                     messages.append(message)
-                    st.write(message)
+                    elapsed = time.perf_counter() - started_at
+                    st.write(f"{message}  ·  {elapsed:,.0f}s")
 
             try:
                 result = generate_route(place, start_street, progress=progress)
                 st.session_state["route_result"] = result
                 status.update(
-                    label="Route loaded from cache" if result.from_cache else "Route generated",
+                    label=(
+                        "Route loaded from cache"
+                        if result.from_cache
+                        else f"Route generated in {time.perf_counter() - started_at:,.0f}s"
+                    ),
                     state="complete",
                     expanded=False,
                 )
@@ -155,4 +163,3 @@ if result:
         "The calculation uses the largest connected walking network and filters mapped private roads, "
         "driveways, parking aisles, and area features. OpenStreetMap can still be incomplete."
     )
-
