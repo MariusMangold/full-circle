@@ -84,9 +84,9 @@ with st.form("route-request", border=True):
     with left:
         preset = st.selectbox("Choose a place", PRESETS.keys(), index=0)
         custom_place = st.text_input(
-            "Or enter a city, municipality, or district",
+            "Or enter a custom city, municipality, or district",
             placeholder="e.g. Kirchheim, Heidelberg, Germany",
-            disabled=preset != "Custom place…",
+            help="If you type a place here, it takes priority over the preset above.",
         )
     with right:
         start_street = st.text_input(
@@ -97,7 +97,7 @@ with st.form("route-request", border=True):
         st.info("Small towns and districts work best. Large cities may exceed the free server’s limits.")
     submitted = st.form_submit_button("Generate route", type="primary", use_container_width=True)
 
-place = custom_place.strip() if preset == "Custom place…" else PRESETS[preset]
+place = custom_place.strip() or PRESETS[preset]
 
 if submitted:
     if not place:
