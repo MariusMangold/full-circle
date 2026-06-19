@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pickle
 import re
@@ -225,7 +226,18 @@ def _start_node(graph, requested_street: str) -> tuple[int, str]:
     if not requested_street.strip():
         center_y = sum(float(data["y"]) for _, data in graph.nodes(data=True)) / graph.number_of_nodes()
         center_x = sum(float(data["x"]) for _, data in graph.nodes(data=True)) / graph.number_of_nodes()
-        node = ox.distance.nearest_nodes(graph, X=center_x, Y=center_y)
+        # Avoid ox.distance.nearest_nodes here: on an unprojected graph it can
+        # require optional scikit-learn/BallTree dependencies. At city scale,
+        # this local equirectangular comparison is accurate enough for choosing
+        # a convenient central starting junction.
+        longitude_scale = math.cos(math.radians(center_y))
+        node = min(
+            graph.nodes,
+            key=lambda candidate: (
+                (float(graph.nodes[candidate]["y"]) - center_y) ** 2
+                + ((float(graph.nodes[candidate]["x"]) - center_x) * longitude_scale) ** 2
+            ),
+        )
         return node, "Near the centre"
 
     target = _normalise(requested_street)

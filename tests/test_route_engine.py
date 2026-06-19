@@ -42,6 +42,12 @@ def test_start_node_matches_normalised_street_name():
     assert name == "Main Street"
 
 
+def test_blank_start_uses_central_node_without_optional_dependencies():
+    node, name = route_engine._start_node(sample_graph(), "")
+    assert node in sample_graph().nodes
+    assert name == "Near the centre"
+
+
 def test_fast_euler_route_is_closed_and_includes_edge_geometry():
     graph = sample_graph()
     euler = route_engine._fast_eulerize(graph)
