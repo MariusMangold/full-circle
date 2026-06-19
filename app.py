@@ -73,7 +73,7 @@ def route_map(result: RouteResult) -> folium.Map:
     return map_view
 
 
-st.title("Every Single Street")
+st.title("Every Single Street - A Mango Original(?)")
 st.markdown(
     "Generate one closed walking route that covers the main connected public street network of a place."
 )
