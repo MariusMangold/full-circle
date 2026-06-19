@@ -1,0 +1,6 @@
+streamlit>=1.41,<2
+osmnx>=2.0,<3
+networkx>=3.4,<4
+gpxpy>=1.6,<2
+folium>=0.19,<1
+

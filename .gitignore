@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.testdeps/
+.streamlit/secrets.toml
+cache/web/
+
+# Locally downloaded/generated routing data. The web app downloads and caches
+# its own copies, so these large files should not be uploaded to GitHub.
+cache/
+*.graphml
+*.pkl
+*.gpx
