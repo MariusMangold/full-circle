@@ -9,6 +9,8 @@ The previous stable version is preserved in `appold.py` and
 - Load a city first and inspect the exact OpenStreetMap `highway=*` road types
   present in its walking network.
 - Select detected road types to exclude from the route.
+- Switch between fast route generation and an exact weighted Chinese Postman
+  optimization that minimizes repeated kilometres.
 - Upload Polygon or MultiPolygon GeoJSON exclusion areas, including exports from
   [geojson.io](https://geojson.io/).
 - View an interactive traversal-frequency map:
@@ -21,6 +23,11 @@ The previous stable version is preserved in `appold.py` and
 Filtering can break a street network into disconnected pieces. The route uses
 the largest connected component remaining after all filters and exclusion areas
 are applied.
+
+Exact mode computes a minimum-weight perfect matching between odd-degree
+junctions. It gives the shortest possible closed route for the retained network,
+but its matching step can take several minutes. Fast mode uses a greedy matching
+and is intended for quick experimentation with filters and geofences.
 
 ## Run locally
 

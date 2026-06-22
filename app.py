@@ -22,7 +22,7 @@ from route_engine import (
 )
 
 
-st.set_page_config(page_title="Every Single Street · Advanced", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Every Single Street · Advanced", page_icon="🗺️", layout="wide")
 st.markdown(
     """
     <style>
@@ -258,6 +258,20 @@ if inventory:
             "Starting street (optional)",
             placeholder="Leave blank to start near the centre",
         )
+        optimization_label = st.radio(
+            "Route optimization",
+            options=["Fast", "Exact shortest"],
+            horizontal=True,
+            help=(
+                "Fast uses a greedy pairing and usually finishes in seconds. Exact shortest solves the "
+                "weighted Chinese Postman problem and minimizes repeated kilometres, but can take several minutes."
+            ),
+        )
+        if optimization_label == "Exact shortest":
+            st.warning(
+                "Exact mode minimizes the final route length mathematically. Keep this page open; "
+                "the matching step can take several minutes on a free server."
+            )
         st.caption(f"The route will use the currently loaded network for **{inventory.place}**.")
 
     with advanced_tab:
@@ -297,6 +311,7 @@ if inventory:
         st.caption("GeoJSON must use longitude/latitude (WGS84), as exported by geojson.io.")
 
     excluded_highways = tuple(highway_label_to_value[label] for label in excluded_labels)
+    optimization_mode = "exact" if optimization_label == "Exact shortest" else "fast"
     geofence_data = geofence_file.getvalue() if geofence_file else None
     geofence_name = geofence_file.name if geofence_file else ""
 
@@ -354,6 +369,7 @@ if inventory:
                     excluded_highways,
                     geofence_data,
                     geofence_name,
+                    optimization_mode=optimization_mode,
                     progress=progress,
                 )
                 st.session_state["route_result"] = result
@@ -424,6 +440,14 @@ if result:
         st.dataframe(pd.DataFrame(category_rows), hide_index=True, use_container_width=True)
 
     with details_tab:
+        st.write(
+            "Optimization: "
+            + (
+                "Exact shortest (minimum repeated distance)"
+                if getattr(result, "optimization_mode", "fast") == "exact"
+                else "Fast"
+            )
+        )
         filter_metrics = st.columns(3)
         filter_metrics[0].metric("Removed by road-type exclusions", f"{result.removed_by_road_filter:,}")
         filter_metrics[1].metric("Removed by GeoJSON", f"{result.removed_by_geofence:,}")

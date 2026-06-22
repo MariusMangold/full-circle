@@ -10,6 +10,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import pickle
 import re
 from collections import Counter, defaultdict
@@ -26,8 +27,9 @@ from shapely.prepared import prep
 import route_engine_old as base
 
 
-ADVANCED_CACHE_VERSION = 2
+ADVANCED_CACHE_VERSION = 3
 DEFAULT_CACHE_DIR = Path("cache/advanced")
+MAX_EXACT_ODD_NODES = int(os.environ.get("MAX_EXACT_ODD_NODES", "900"))
 
 ROAD_CATEGORIES: dict[str, dict[str, object]] = {
     "main_roads": {
@@ -149,6 +151,7 @@ class AdvancedRouteResult:
     removed_private: int
     traversal_histogram: dict[int, int]
     category_statistics: dict[str, dict[str, float]]
+    optimization_mode: str
     gpx_xml: str
     from_cache: bool = False
 
@@ -383,13 +386,20 @@ def _prepare_advanced_graph(raw_graph, excluded_highways: set[str], exclusion, c
     return main, counts
 
 
-def _cache_key(place: str, start: str, excluded_highways: tuple[str, ...], geofence_data: bytes | None) -> str:
+def _cache_key(
+    place: str,
+    start: str,
+    excluded_highways: tuple[str, ...],
+    geofence_data: bytes | None,
+    optimization_mode: str,
+) -> str:
     payload = {
         "version": ADVANCED_CACHE_VERSION,
         "place": place.strip().casefold(),
         "start": start.strip().casefold(),
         "excluded_highways": excluded_highways,
         "geofence": hashlib.sha256(geofence_data or b"").hexdigest(),
+        "optimization_mode": optimization_mode,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -415,7 +425,18 @@ def _segment_name(data: dict) -> str:
     return str(name) if name else "Unnamed way"
 
 
-def _build_result(place, start_street, actual_start, excluded_highways, geofence_name, graph, circuit, euler_graph, counts):
+def _build_result(
+    place,
+    start_street,
+    actual_start,
+    excluded_highways,
+    geofence_name,
+    optimization_mode,
+    graph,
+    circuit,
+    euler_graph,
+    counts,
+):
     traversal_counts = Counter()
     for u, v, key in circuit:
         data = euler_graph.get_edge_data(u, v, key) or {}
@@ -468,8 +489,61 @@ def _build_result(place, start_street, actual_start, excluded_highways, geofence
         removed_private=counts.get("private", 0),
         traversal_histogram=histogram,
         category_statistics=dict(category_statistics),
+        optimization_mode=optimization_mode,
         gpx_xml=base._gpx(place, actual_start, coordinates),
     )
+
+
+def _exact_eulerize(graph, callback: ProgressCallback | None = None):
+    """Exactly minimize duplicated distance with the Chinese Postman method."""
+    odd_nodes = sorted((node for node, degree in graph.degree() if degree % 2), key=str)
+    if not odd_nodes:
+        return graph.copy()
+    if len(odd_nodes) > MAX_EXACT_ODD_NODES:
+        raise base.RouteTooLargeError(
+            f"Exact optimization would need to match {len(odd_nodes):,} odd junctions. "
+            f"The hosted safety limit is {MAX_EXACT_ODD_NODES:,}; use Fast mode or reduce the network."
+        )
+
+    matching_graph = nx.Graph()
+    matching_graph.add_nodes_from(odd_nodes)
+    report_every = max(1, len(odd_nodes) // 10)
+    for index, source in enumerate(odd_nodes[:-1]):
+        distances = nx.single_source_dijkstra_path_length(graph, source, weight="length")
+        for target in odd_nodes[index + 1:]:
+            if target not in distances:
+                raise base.RouteError("Some odd junctions are disconnected and cannot be matched.")
+            # OSMnx stores edge lengths to millimetre precision. Integer weights
+            # preserve that precision and make NetworkX's Blossom matcher faster
+            # and deterministic compared with floating-point arithmetic.
+            matching_graph.add_edge(source, target, weight=int(round(float(distances[target]) * 1000)))
+        if index % report_every == 0:
+            percent = max(1, int((index + 1) * 100 / (len(odd_nodes) - 1)))
+            _notify(callback, f"Measuring exact junction distances… {percent}%")
+
+    _notify(callback, "Solving the minimum-distance perfect matching… this is the slow step.")
+    matching = nx.min_weight_matching(matching_graph, weight="weight")
+    if len(matching) * 2 != len(odd_nodes):
+        raise base.RouteError("Exact optimization could not find a complete junction matching.")
+
+    euler_graph = nx.MultiGraph(graph)
+    total_pairs = len(matching)
+    for completed, pair in enumerate(matching, 1):
+        source, target = tuple(pair)
+        path = nx.shortest_path(graph, source, target, weight="length")
+        for u, v in zip(path, path[1:]):
+            options = graph.get_edge_data(u, v)
+            if not options:
+                raise base.RouteError("A matched shortest-path segment disappeared during optimization.")
+            _key, data = min(options.items(), key=lambda item: base._edge_length(item[1], 1.0))
+            euler_graph.add_edge(u, v, **data.copy())
+        if completed == 1 or completed % max(1, total_pairs // 10) == 0:
+            percent = max(1, int(completed * 100 / total_pairs))
+            _notify(callback, f"Adding exact shortest connections… {percent}%")
+
+    if not nx.is_eulerian(euler_graph):
+        raise base.RouteError("The exactly augmented street network is unexpectedly not Eulerian.")
+    return euler_graph
 
 
 def generate_route(
@@ -479,17 +553,21 @@ def generate_route(
     geofence_data: bytes | None = None,
     geofence_name: str = "",
     *,
+    optimization_mode: str = "fast",
     cache_dir: Path | str = DEFAULT_CACHE_DIR,
     progress: ProgressCallback | None = None,
 ) -> AdvancedRouteResult:
     place = " ".join(place.split())
     start_street = " ".join(start_street.split())
     excluded = tuple(sorted({str(value).strip().casefold() for value in excluded_highways if str(value).strip()}))
+    optimization_mode = optimization_mode.strip().casefold()
     if len(place) < 3 or len(place) > 160:
         raise base.RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
+    if optimization_mode not in {"fast", "exact"}:
+        raise base.RouteError("Optimization mode must be either 'fast' or 'exact'.")
 
     cache_dir = Path(cache_dir)
-    key = _cache_key(place, start_street, excluded, geofence_data)
+    key = _cache_key(place, start_street, excluded, geofence_data, optimization_mode)
     result_path = cache_dir / "routes" / f"{key}.pkl"
     cached = _load_result(result_path)
     if cached:
@@ -529,14 +607,18 @@ def generate_route(
             )
 
         start_node, actual_start = base._start_node(graph, start_street)
-        _notify(progress, f"Connecting {odd_nodes:,} odd junctions into a closed route…")
-        euler_graph = base._fast_eulerize(graph, progress)
+        if optimization_mode == "exact":
+            _notify(progress, f"Exactly optimizing {odd_nodes:,} odd junctions for minimum repeated distance…")
+            euler_graph = _exact_eulerize(graph, progress)
+        else:
+            _notify(progress, f"Quickly connecting {odd_nodes:,} odd junctions into a closed route…")
+            euler_graph = base._fast_eulerize(graph, progress)
         _notify(progress, "Calculating traversals and route statistics…")
         circuit = list(nx.eulerian_circuit(euler_graph, source=start_node, keys=True))
         if not circuit:
             raise base.RouteError("The generated advanced route was empty.")
         result = _build_result(
-            place, start_street, actual_start, excluded, geofence_name,
+            place, start_street, actual_start, excluded, geofence_name, optimization_mode,
             graph, circuit, euler_graph, counts,
         )
         try:

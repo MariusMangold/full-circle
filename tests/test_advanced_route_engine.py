@@ -84,10 +84,26 @@ def test_statistics_count_repeated_segments_and_export_csv():
     euler = base._fast_eulerize(graph)
     circuit = list(nx.eulerian_circuit(euler, source=1, keys=True))
     result = advanced._build_result(
-        "Test place", "", "Near the centre", ("track",), "",
+        "Test place", "", "Near the centre", ("track",), "", "fast",
         graph, circuit, euler, {},
     )
     assert result.traversal_histogram[2] == 2
     assert result.distance_km == 0.44
     assert result.excluded_highways == ("track",)
+    assert result.optimization_mode == "fast"
     assert "First Street" in result.statistics_csv()
+
+
+def test_exact_optimization_is_eulerian_and_minimizes_the_only_odd_pair():
+    graph = _statistics_graph()
+    exact = advanced._exact_eulerize(graph)
+    assert nx.is_eulerian(exact)
+    original_length = sum(data["length"] for *_edge, data in graph.edges(keys=True, data=True))
+    exact_length = sum(data["length"] for *_edge, data in exact.edges(keys=True, data=True))
+    assert exact_length - original_length == original_length
+
+
+def test_fast_and_exact_modes_have_separate_cache_keys():
+    fast = advanced._cache_key("Test", "", (), None, "fast")
+    exact = advanced._cache_key("Test", "", (), None, "exact")
+    assert fast != exact
