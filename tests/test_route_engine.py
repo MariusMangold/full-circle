@@ -3,7 +3,7 @@ from pathlib import Path
 import networkx as nx
 from shapely.geometry import LineString
 
-import route_engine
+import route_engine_old
 
 
 def sample_graph():
@@ -37,37 +37,37 @@ def sample_graph():
 
 
 def test_start_node_matches_normalised_street_name():
-    node, name = route_engine._start_node(sample_graph(), "Main StReEt")
+    node, name = route_engine_old._start_node(sample_graph(), "Main StReEt")
     assert node in {1, 2}
     assert name == "Main Street"
 
 
 def test_blank_start_uses_central_node_without_optional_dependencies():
-    node, name = route_engine._start_node(sample_graph(), "")
+    node, name = route_engine_old._start_node(sample_graph(), "")
     assert node in sample_graph().nodes
     assert name == "Near the centre"
 
 
 def test_fast_euler_route_is_closed_and_includes_edge_geometry():
     graph = sample_graph()
-    euler = route_engine._fast_eulerize(graph)
+    euler = route_engine_old._fast_eulerize(graph)
     assert nx.is_eulerian(euler)
     assert euler.number_of_edges() >= graph.number_of_edges()
     circuit = list(nx.eulerian_circuit(euler, source=1, keys=True))
-    coordinates = route_engine._route_coordinates(euler, circuit)
+    coordinates = route_engine_old._route_coordinates(euler, circuit)
     assert coordinates[0] == coordinates[-1]
     assert len(coordinates) >= len(circuit)
 
 
 def test_fast_euler_route_preserves_every_original_edge():
     graph = sample_graph()
-    euler = route_engine._fast_eulerize(graph)
+    euler = route_engine_old._fast_eulerize(graph)
     for u, v, key in graph.edges(keys=True):
         assert euler.has_edge(u, v, key)
 
 
 def test_result_cache_round_trip(tmp_path: Path):
-    result = route_engine.RouteResult(
+    result = route_engine_old.RouteResult(
         place="Test, Germany",
         requested_start="",
         actual_start="Near the centre",
@@ -80,12 +80,12 @@ def test_result_cache_round_trip(tmp_path: Path):
         gpx_xml="<gpx />",
     )
     path = tmp_path / "route.pkl"
-    route_engine._atomic_pickle(path, result)
-    loaded = route_engine._load_result(path)
+    route_engine_old._atomic_pickle(path, result)
+    loaded = route_engine_old._load_result(path)
     assert loaded is not None
     assert loaded.place == result.place
     assert loaded.from_cache is True
 
 
 def test_identical_requests_share_one_lock():
-    assert route_engine._request_lock("same-key") is route_engine._request_lock("same-key")
+    assert route_engine_old._request_lock("same-key") is route_engine_old._request_lock("same-key")

@@ -1,67 +1,145 @@
-"""Routing engine for the Every Single Street web app.
+"""Advanced routing engine with road filters, geofences, and traversal stats.
 
-The module deliberately has no Streamlit dependency so the expensive routing
-work can be tested and reused from another UI later.
+This module intentionally lives beside, rather than inside, ``route_engine`` so
+the stable application remains unchanged.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
-import math
-import os
 import pickle
 import re
-import threading
-import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-import gpxpy.gpx
 import networkx as nx
 import osmnx as ox
+from shapely.geometry import LineString, shape
+from shapely.ops import unary_union
+from shapely.prepared import prep
+
+import route_engine_old as base
 
 
-CACHE_VERSION = 1
-DEFAULT_CACHE_DIR = Path(os.environ.get("ROUTE_CACHE_DIR", "cache/web"))
-MAX_AREA_KM2 = int(os.environ.get("MAX_AREA_KM2", "250"))
-MAX_NODES = int(os.environ.get("MAX_NODES", "12000"))
-MAX_EDGES = int(os.environ.get("MAX_EDGES", "30000"))
-MAX_ODD_NODES = int(os.environ.get("MAX_ODD_NODES", "1200"))
+ADVANCED_CACHE_VERSION = 1
+DEFAULT_CACHE_DIR = Path("cache/advanced")
 
-_REQUEST_LOCKS: dict[str, threading.Lock] = {}
-_REQUEST_LOCKS_GUARD = threading.Lock()
+ROAD_CATEGORIES: dict[str, dict[str, object]] = {
+    "main_roads": {
+        "label": "Main roads",
+        "description": "Primary, secondary and tertiary roads",
+        "highways": {
+            "primary", "primary_link", "secondary", "secondary_link",
+            "tertiary", "tertiary_link",
+        },
+    },
+    "residential": {
+        "label": "Residential streets",
+        "description": "Residential and living streets",
+        "highways": {"residential", "living_street"},
+    },
+    "local_roads": {
+        "label": "Local / unclassified roads",
+        "description": "Unclassified roads and roads without a clearer class",
+        "highways": {"unclassified", "road"},
+    },
+    "footways": {
+        "label": "Footways and pedestrian areas",
+        "description": "Footways, pedestrian ways, paths and corridors",
+        "highways": {"footway", "pedestrian", "path", "corridor"},
+    },
+    "cycleways": {
+        "label": "Cycleways",
+        "description": "Mapped cycleways that are available in the walking network",
+        "highways": {"cycleway"},
+    },
+    "tracks": {
+        "label": "Tracks",
+        "description": "Agricultural, forest and other mapped tracks",
+        "highways": {"track"},
+    },
+    "steps": {
+        "label": "Steps",
+        "description": "Stairways and stepped paths",
+        "highways": {"steps"},
+    },
+    "service_roads": {
+        "label": "Public service roads",
+        "description": "Public service roads; driveways and parking aisles remain excluded",
+        "highways": {"service"},
+    },
+    "other": {
+        "label": "Other walkable ways",
+        "description": "Walkable highway tags not covered by the groups above",
+        "highways": set(),
+    },
+}
+
+ALL_CATEGORY_IDS = tuple(ROAD_CATEGORIES)
+_KNOWN_HIGHWAYS = set().union(
+    *(category["highways"] for key, category in ROAD_CATEGORIES.items() if key != "other")
+)
 
 ProgressCallback = Callable[[str], None]
 
 
-class RouteError(RuntimeError):
-    """A problem that can be shown directly to an app user."""
-
-
-class RouteTooLargeError(RouteError):
-    """The requested area is unsafe to calculate on a small hosted server."""
+@dataclass
+class SegmentStat:
+    edge_id: str
+    name: str
+    category: str
+    highway: str
+    length_m: float
+    traversals: int
+    coordinates: list[tuple[float, float]]
 
 
 @dataclass
-class RouteResult:
+class AdvancedRouteResult:
     place: str
     requested_start: str
     actual_start: str
+    selected_categories: tuple[str, ...]
+    geofence_name: str
     coordinates: list[tuple[float, float]]
+    segments: list[SegmentStat]
     distance_km: float
     street_length_km: float
+    repeated_distance_km: float
     nodes: int
     streets: int
-    repeated_distance_km: float
+    removed_by_road_filter: int
+    removed_by_geofence: int
+    removed_private: int
+    traversal_histogram: dict[int, int]
+    category_statistics: dict[str, dict[str, float]]
     gpx_xml: str
     from_cache: bool = False
 
     @property
     def download_filename(self) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", _ascii(self.place).lower()).strip("-")
-        return f"{slug or 'every-street'}-route.gpx"
+        slug = re.sub(r"[^a-z0-9]+", "-", base._ascii(self.place).lower()).strip("-")
+        return f"{slug or 'every-street'}-advanced-route.gpx"
+
+    def statistics_csv(self) -> str:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["segment_id", "street_name", "category", "highway", "length_m", "traversals"])
+        for segment in self.segments:
+            writer.writerow([
+                segment.edge_id,
+                segment.name,
+                ROAD_CATEGORIES[segment.category]["label"],
+                segment.highway,
+                f"{segment.length_m:.1f}",
+                segment.traversals,
+            ])
+        return output.getvalue()
 
 
 def _notify(callback: ProgressCallback | None, message: str) -> None:
@@ -69,417 +147,275 @@ def _notify(callback: ProgressCallback | None, message: str) -> None:
         callback(message)
 
 
-def _ascii(value: str) -> str:
-    return unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+def _geojson_geometries(payload: object) -> Iterable[dict]:
+    if not isinstance(payload, dict):
+        raise base.RouteError("The uploaded GeoJSON must contain a JSON object.")
+    object_type = payload.get("type")
+    if object_type == "FeatureCollection":
+        for feature in payload.get("features", []):
+            if isinstance(feature, dict) and feature.get("geometry"):
+                yield feature["geometry"]
+    elif object_type == "Feature":
+        if payload.get("geometry"):
+            yield payload["geometry"]
+    elif object_type in {"Polygon", "MultiPolygon"}:
+        yield payload
+    else:
+        raise base.RouteError("Upload polygon or multipolygon GeoJSON, such as an export from geojson.io.")
 
 
-def _normalise(value: object) -> str:
-    text = _ascii(str(value)).casefold().replace("str.", "strasse")
-    return re.sub(r"[^a-z0-9]", "", text)
+def parse_exclusion_geojson(data: bytes | None):
+    if not data:
+        return None
+    if len(data) > 5 * 1024 * 1024:
+        raise base.RouteError("The GeoJSON file is larger than the 5 MB limit.")
+    try:
+        payload = json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise base.RouteError(f"The uploaded file is not valid GeoJSON: {exc}") from exc
+
+    polygons = []
+    for geometry_data in _geojson_geometries(payload):
+        try:
+            geometry = shape(geometry_data)
+        except Exception as exc:
+            raise base.RouteError(f"A GeoJSON geometry could not be read: {exc}") from exc
+        if geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise base.RouteError("Every exclusion geometry must be a polygon or multipolygon.")
+        if not geometry.is_valid:
+            geometry = geometry.buffer(0)
+        if not geometry.is_empty:
+            polygons.append(geometry)
+    if not polygons:
+        raise base.RouteError("The GeoJSON contains no usable polygon areas.")
+    return unary_union(polygons)
 
 
-def _cache_key(place: str, start_street: str) -> str:
-    raw = json.dumps(
-        {
-            "version": CACHE_VERSION,
-            "place": place.strip().casefold(),
-            "start": start_street.strip().casefold(),
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()
+def _highway_values(data: dict) -> set[str]:
+    value = data.get("highway")
+    if isinstance(value, (list, tuple, set)):
+        return {str(item).casefold() for item in value}
+    return {str(value).casefold()} if value else set()
 
 
-def _place_key(place: str) -> str:
-    return hashlib.sha256(place.strip().casefold().encode()).hexdigest()
+def edge_categories(data: dict) -> set[str]:
+    highways = _highway_values(data)
+    matched = {
+        category_id
+        for category_id, category in ROAD_CATEGORIES.items()
+        if category_id != "other" and highways.intersection(category["highways"])
+    }
+    if not matched and (not highways or highways - _KNOWN_HIGHWAYS):
+        matched.add("other")
+    return matched
 
 
-def _atomic_pickle(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("wb") as handle:
-        pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    temporary.replace(path)
+def _edge_geometry(graph, u, v, data: dict):
+    geometry = data.get("geometry")
+    if geometry is not None:
+        return geometry
+    return LineString([
+        (float(graph.nodes[u]["x"]), float(graph.nodes[u]["y"])),
+        (float(graph.nodes[v]["x"]), float(graph.nodes[v]["y"])),
+    ])
 
 
-def _load_result(path: Path) -> RouteResult | None:
+def _prepare_advanced_graph(raw_graph, selected_categories: set[str], exclusion, callback):
+    _notify(callback, "Applying road categories, access rules, and exclusion areas…")
+    graph = raw_graph.copy()
+    denied_access = {"private", "no", "customers", "delivery"}
+    denied_service = {"parking_aisle", "driveway", "private", "alley", "parking", "yard"}
+    prepared_exclusion = prep(exclusion) if exclusion is not None else None
+    removals = []
+    counts = Counter()
+
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        reason = None
+        if denied_access.intersection(base._values(data.get("access"))):
+            reason = "private"
+        elif denied_service.intersection(base._values(data.get("service"))):
+            reason = "private"
+        elif {"yes", "true", "1"}.intersection(base._values(data.get("area"))):
+            reason = "private"
+        elif not edge_categories(data).intersection(selected_categories):
+            reason = "road_filter"
+        elif prepared_exclusion and prepared_exclusion.intersects(_edge_geometry(graph, u, v, data)):
+            reason = "geofence"
+        if reason:
+            removals.append((u, v, key))
+            counts[reason] += 1
+
+    graph.remove_edges_from(removals)
+    graph.remove_nodes_from(list(nx.isolates(graph)))
+    if graph.number_of_nodes() == 0:
+        raise base.RouteError("No streets remain after applying the advanced filters.")
+
+    undirected = ox.convert.to_undirected(graph)
+    components = list(nx.connected_components(undirected))
+    if not components:
+        raise base.RouteError("The selected streets do not form a connected network.")
+    main = undirected.subgraph(max(components, key=len)).copy()
+    if main.number_of_edges() == 0:
+        raise base.RouteError("The largest remaining connected network contains no streets.")
+
+    for index, (u, v, key, data) in enumerate(main.edges(keys=True, data=True)):
+        data["_advanced_edge_id"] = f"edge-{index}"
+        categories = edge_categories(data).intersection(selected_categories)
+        data["_advanced_category"] = sorted(categories)[0] if categories else "other"
+    return main, counts
+
+
+def _cache_key(place: str, start: str, categories: tuple[str, ...], geofence_data: bytes | None) -> str:
+    payload = {
+        "version": ADVANCED_CACHE_VERSION,
+        "place": place.strip().casefold(),
+        "start": start.strip().casefold(),
+        "categories": categories,
+        "geofence": hashlib.sha256(geofence_data or b"").hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _load_result(path: Path) -> AdvancedRouteResult | None:
     if not path.exists():
         return None
     try:
         with path.open("rb") as handle:
-            value = pickle.load(handle)
-        if isinstance(value, RouteResult):
-            value.from_cache = True
-            return value
+            result = pickle.load(handle)
+        if isinstance(result, AdvancedRouteResult):
+            result.from_cache = True
+            return result
     except (OSError, pickle.PickleError, EOFError, AttributeError):
         path.unlink(missing_ok=True)
     return None
 
 
-def _area_km2(place: str) -> float:
-    boundary = ox.geocode_to_gdf(place)
-    if boundary.empty:
-        raise RouteError("OpenStreetMap could not find that place. Add the country or region and try again.")
-    try:
-        projected = boundary.to_crs(boundary.estimate_utm_crs())
-        return float(projected.geometry.area.sum() / 1_000_000)
-    except Exception:
-        # Area is only an early guard. Graph-size guards still protect the server.
-        return 0.0
-
-
-def _download_graph(place: str, cache_dir: Path, callback: ProgressCallback | None):
-    graph_path = cache_dir / "graphs" / f"{_place_key(place)}.graphml"
-    if graph_path.exists():
-        _notify(callback, "Loading the cached street network…")
-        try:
-            return ox.load_graphml(graph_path)
-        except Exception:
-            graph_path.unlink(missing_ok=True)
-
-    _notify(callback, "Checking the size of the requested area…")
-    try:
-        area_km2 = _area_km2(place)
-    except RouteError:
-        raise
-    except Exception as exc:
-        raise RouteError(f"OpenStreetMap could not resolve that place: {exc}") from exc
-    if area_km2 > MAX_AREA_KM2:
-        raise RouteTooLargeError(
-            f"That boundary is about {area_km2:,.0f} km². The free server limit is "
-            f"{MAX_AREA_KM2} km²; try a district or smaller municipality."
-        )
-
-    _notify(callback, "Downloading walkable streets from OpenStreetMap…")
-    try:
-        graph = ox.graph_from_place(place, network_type="walk", simplify=True)
-    except Exception as exc:
-        raise RouteError(f"The street network could not be downloaded: {exc}") from exc
-
-    if graph.number_of_nodes() > MAX_NODES or graph.number_of_edges() > MAX_EDGES:
-        raise RouteTooLargeError(
-            f"This place contains {graph.number_of_nodes():,} junctions and "
-            f"{graph.number_of_edges():,} street segments. Try a district or a smaller place."
-        )
-
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        ox.save_graphml(graph, graph_path)
-    except OSError:
-        pass  # A read-only/ephemeral host can still finish the current request.
-    return graph
-
-
-def _values(value: object) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return [str(item).casefold() for item in value]
-    return [str(value).casefold()]
-
-
-def _prepare_graph(graph, callback: ProgressCallback | None):
-    _notify(callback, "Removing private roads, driveways, parking aisles, and mapped areas…")
-    denied_access = {"private", "no", "customers", "delivery"}
-    denied_service = {
-        "parking_aisle",
-        "driveway",
-        "private",
-        "alley",
-        "industrial",
-        "parking",
-        "yard",
-    }
-    edges_to_remove = []
-    for u, v, key, data in graph.edges(keys=True, data=True):
-        if denied_access.intersection(_values(data.get("access"))):
-            edges_to_remove.append((u, v, key))
-        elif denied_service.intersection(_values(data.get("service"))):
-            edges_to_remove.append((u, v, key))
-        elif {"yes", "true", "1"}.intersection(_values(data.get("area"))):
-            edges_to_remove.append((u, v, key))
-
-    cleaned = graph.copy()
-    cleaned.remove_edges_from(edges_to_remove)
-    cleaned.remove_nodes_from(list(nx.isolates(cleaned)))
-    undirected = ox.convert.to_undirected(cleaned)
-    if undirected.number_of_nodes() == 0:
-        raise RouteError("No connected public walking streets remained after filtering.")
-
-    components = list(nx.connected_components(undirected))
-    main_nodes = max(components, key=len)
-    main = undirected.subgraph(main_nodes).copy()
-    if main.number_of_edges() == 0:
-        raise RouteError("No connected public walking streets were found for that place.")
-    return main
-
-
-def _edge_names(data: dict) -> Iterable[str]:
+def _segment_name(data: dict) -> str:
     name = data.get("name")
     if isinstance(name, list):
-        yield from (str(value) for value in name)
-    elif name:
-        yield str(name)
+        return " / ".join(str(value) for value in name)
+    return str(name) if name else "Unnamed way"
 
 
-def _start_node(graph, requested_street: str) -> tuple[int, str]:
-    if not requested_street.strip():
-        center_y = sum(float(data["y"]) for _, data in graph.nodes(data=True)) / graph.number_of_nodes()
-        center_x = sum(float(data["x"]) for _, data in graph.nodes(data=True)) / graph.number_of_nodes()
-        # Avoid ox.distance.nearest_nodes here: on an unprojected graph it can
-        # require optional scikit-learn/BallTree dependencies. At city scale,
-        # this local equirectangular comparison is accurate enough for choosing
-        # a convenient central starting junction.
-        longitude_scale = math.cos(math.radians(center_y))
-        node = min(
-            graph.nodes,
-            key=lambda candidate: (
-                (float(graph.nodes[candidate]["y"]) - center_y) ** 2
-                + ((float(graph.nodes[candidate]["x"]) - center_x) * longitude_scale) ** 2
-            ),
-        )
-        return node, "Near the centre"
-
-    target = _normalise(requested_street)
-    exact: list[tuple[int, str]] = []
-    partial: list[tuple[int, str]] = []
-    available: set[str] = set()
-    for u, _v, _key, data in graph.edges(keys=True, data=True):
-        for name in _edge_names(data):
-            available.add(name)
-            normalised = _normalise(name)
-            if normalised == target:
-                exact.append((u, name))
-            elif target and (target in normalised or normalised in target):
-                partial.append((u, name))
-    candidates = exact or partial
-    if candidates:
-        return candidates[0]
-
-    suggestions = sorted(available, key=lambda name: _edit_distance(target, _normalise(name)))[:5]
-    hint = f" Similar mapped streets: {', '.join(suggestions)}." if suggestions else ""
-    raise RouteError(
-        f"The starting street ‘{requested_street}’ was not found inside this boundary."
-        f" Leave it blank to start near the centre.{hint}"
-    )
-
-
-def _edit_distance(left: str, right: str) -> int:
-    previous = list(range(len(right) + 1))
-    for i, left_char in enumerate(left, 1):
-        current = [i]
-        for j, right_char in enumerate(right, 1):
-            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (left_char != right_char)))
-        previous = current
-    return previous[-1]
-
-
-def _oriented_edge_coordinates(graph, u: int, v: int, key: int) -> list[tuple[float, float]]:
-    data = graph.get_edge_data(u, v, key) or {}
-    geometry = data.get("geometry")
-    if geometry is None:
-        return [(float(graph.nodes[u]["y"]), float(graph.nodes[u]["x"])),
-                (float(graph.nodes[v]["y"]), float(graph.nodes[v]["x"]))]
-
-    coords = [(float(y), float(x)) for x, y in geometry.coords]
-    u_coord = (float(graph.nodes[u]["y"]), float(graph.nodes[u]["x"]))
-    if coords and _distance_sq(coords[-1], u_coord) < _distance_sq(coords[0], u_coord):
-        coords.reverse()
-    return coords
-
-
-def _distance_sq(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
-
-
-def _route_coordinates(graph, circuit: list[tuple[int, int, int]]) -> list[tuple[float, float]]:
-    coordinates: list[tuple[float, float]] = []
+def _build_result(place, start_street, actual_start, categories, geofence_name, graph, circuit, euler_graph, counts):
+    traversal_counts = Counter()
     for u, v, key in circuit:
-        segment = _oriented_edge_coordinates(graph, u, v, key)
-        if coordinates and segment and coordinates[-1] == segment[0]:
-            coordinates.extend(segment[1:])
-        else:
-            coordinates.extend(segment)
-    return coordinates
+        data = euler_graph.get_edge_data(u, v, key) or {}
+        edge_id = data.get("_advanced_edge_id")
+        if edge_id:
+            traversal_counts[edge_id] += 1
 
+    segments = []
+    category_statistics = defaultdict(lambda: {"segments": 0, "street_km": 0.0, "route_km": 0.0})
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        edge_id = data["_advanced_edge_id"]
+        category = data["_advanced_category"]
+        length_m = base._edge_length(data)
+        traversals = traversal_counts.get(edge_id, 1)
+        highway = ", ".join(sorted(_highway_values(data))) or "unknown"
+        coordinates = base._oriented_edge_coordinates(graph, u, v, key)
+        segments.append(SegmentStat(
+            edge_id=edge_id,
+            name=_segment_name(data),
+            category=category,
+            highway=highway,
+            length_m=length_m,
+            traversals=traversals,
+            coordinates=coordinates,
+        ))
+        stats = category_statistics[category]
+        stats["segments"] += 1
+        stats["street_km"] += length_m / 1000
+        stats["route_km"] += length_m * traversals / 1000
 
-def _gpx(place: str, start: str, coordinates: list[tuple[float, float]]) -> str:
-    gpx = gpxpy.gpx.GPX()
-    gpx.creator = "Every Single Street"
-    track = gpxpy.gpx.GPXTrack(name=f"Every street in {place}")
-    gpx.tracks.append(track)
-    segment = gpxpy.gpx.GPXTrackSegment()
-    track.segments.append(segment)
-    for latitude, longitude in coordinates:
-        segment.points.append(gpxpy.gpx.GPXTrackPoint(latitude, longitude))
-    gpx.description = f"Every Single Street route; start: {start}"
-    return gpx.to_xml()
-
-
-def _edge_length(data: dict, fallback: float = 0.0) -> float:
-    value = data.get("length", fallback)
-    if isinstance(value, list):
-        value = min(value) if value else fallback
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return fallback
-
-
-def _request_lock(cache_key: str) -> threading.Lock:
-    """Return one process-local lock per route request.
-
-    Streamlit serves multiple sessions in one process. Without this guard, two
-    friends clicking the same uncached city can start the same expensive job.
-    """
-    with _REQUEST_LOCKS_GUARD:
-        return _REQUEST_LOCKS.setdefault(cache_key, threading.Lock())
-
-
-def _fast_eulerize(graph, callback: ProgressCallback | None = None):
-    """Make a connected graph Eulerian using global-greedy odd-node pairing.
-
-    NetworkX's :func:`eulerize` builds a complete graph of all odd junctions and
-    solves a global matching problem. That produces a good pairing but becomes
-    painfully slow on street networks. Here all odd-junction distances are
-    measured, then the shortest available pair is repeatedly selected. Every
-    original edge is still covered and the result is still a closed Euler
-    circuit; the repeated portion is usually compact but not globally minimal.
-    """
-    odd_nodes = sorted((node for node, degree in graph.degree() if degree % 2), key=str)
-    if not odd_nodes:
-        return graph.copy()
-
-    euler_graph = nx.MultiGraph(graph)
-    total_pairs = len(odd_nodes) // 2
-    candidate_pairs: list[tuple[float, str, str, int, int]] = []
-    report_every = max(1, len(odd_nodes) // 10)
-
-    # Retain only distances between odd nodes, not a dense paths dictionary.
-    # This keeps memory bounded while avoiding NetworkX's cubic global matcher.
-    for index, source in enumerate(odd_nodes[:-1]):
-        try:
-            distances = nx.single_source_dijkstra_path_length(graph, source, weight="length")
-        except nx.NetworkXError as exc:
-            raise RouteError(f"Could not measure distances between odd junctions: {exc}") from exc
-        for target in odd_nodes[index + 1:]:
-            if target in distances:
-                candidate_pairs.append((distances[target], str(source), str(target), source, target))
-        if index % report_every == 0:
-            percent = max(1, int((index + 1) * 100 / (len(odd_nodes) - 1)))
-            _notify(callback, f"Measuring junction connections… {percent}%")
-
-    candidate_pairs.sort()
-    unmatched = set(odd_nodes)
-    pairings: list[tuple[int, int]] = []
-    for _distance, _source_order, _target_order, source, target in candidate_pairs:
-        if source in unmatched and target in unmatched:
-            unmatched.remove(source)
-            unmatched.remove(target)
-            pairings.append((source, target))
-            if not unmatched:
-                break
-    if unmatched:
-        raise RouteError("Some street junctions could not be paired into a closed route.")
-
-    for completed_pairs, (source, target) in enumerate(pairings, 1):
-        path = nx.shortest_path(graph, source, target, weight="length")
-        for u, v in zip(path, path[1:]):
-            options = graph.get_edge_data(u, v)
-            if not options:
-                raise RouteError("A shortest-path street segment disappeared during route generation.")
-            _key, data = min(options.items(), key=lambda item: _edge_length(item[1], 1.0))
-            euler_graph.add_edge(u, v, **data.copy())
-        percent = max(1, int(completed_pairs * 100 / total_pairs))
-        if completed_pairs == 1 or completed_pairs % max(1, total_pairs // 10) == 0:
-            _notify(callback, f"Adding shortest connections… {percent}%")
-
-    if not nx.is_eulerian(euler_graph):
-        raise RouteError("The augmented street network is unexpectedly not Eulerian.")
-    return euler_graph
-
-
-def _generate_uncached_route(
-    place: str,
-    start_street: str,
-    cache_dir: Path,
-    result_path: Path,
-    progress: ProgressCallback | None,
-) -> RouteResult:
-    raw_graph = _download_graph(place, cache_dir, progress)
-    graph = _prepare_graph(raw_graph, progress)
-    if graph.number_of_nodes() > MAX_NODES or graph.number_of_edges() > MAX_EDGES:
-        raise RouteTooLargeError("The connected street network is too large for the free server.")
-
-    start_node, actual_start = _start_node(graph, start_street)
-    odd_nodes = sum(1 for _, degree in graph.degree() if degree % 2)
-    if odd_nodes > MAX_ODD_NODES:
-        raise RouteTooLargeError(
-            f"This network has {odd_nodes:,} odd junctions, making the route too expensive. "
-            "Try a smaller district."
-        )
-
-    _notify(progress, f"Connecting {odd_nodes:,} odd junctions into a closed route…")
-    euler_graph = _fast_eulerize(graph, progress)
-
-    _notify(progress, "Calculating the complete turn-by-turn circuit…")
-    circuit = list(nx.eulerian_circuit(euler_graph, source=start_node, keys=True))
-    if not circuit:
-        raise RouteError("The generated route was empty.")
-
-    _notify(progress, "Building the interactive map and GPX file…")
-    coordinates = _route_coordinates(euler_graph, circuit)
-    route_metres = sum(_edge_length(euler_graph.get_edge_data(u, v, key) or {}) for u, v, key in circuit)
-    street_metres = sum(_edge_length(data) for *_edge, data in graph.edges(keys=True, data=True))
-    result = RouteResult(
+    coordinates = base._route_coordinates(euler_graph, circuit)
+    route_metres = sum(base._edge_length(euler_graph.get_edge_data(u, v, key) or {}) for u, v, key in circuit)
+    street_metres = sum(segment.length_m for segment in segments)
+    histogram = dict(sorted(Counter(segment.traversals for segment in segments).items()))
+    return AdvancedRouteResult(
         place=place,
         requested_start=start_street,
         actual_start=actual_start,
+        selected_categories=categories,
+        geofence_name=geofence_name,
         coordinates=coordinates,
+        segments=segments,
         distance_km=route_metres / 1000,
         street_length_km=street_metres / 1000,
+        repeated_distance_km=max(0.0, (route_metres - street_metres) / 1000),
         nodes=graph.number_of_nodes(),
         streets=graph.number_of_edges(),
-        repeated_distance_km=max(0.0, (route_metres - street_metres) / 1000),
-        gpx_xml=_gpx(place, actual_start, coordinates),
+        removed_by_road_filter=counts.get("road_filter", 0),
+        removed_by_geofence=counts.get("geofence", 0),
+        removed_private=counts.get("private", 0),
+        traversal_histogram=histogram,
+        category_statistics=dict(category_statistics),
+        gpx_xml=base._gpx(place, actual_start, coordinates),
     )
-    try:
-        _atomic_pickle(result_path, result)
-    except OSError:
-        pass
-    return result
 
 
-def generate_route(
+def generate_advanced_route(
     place: str,
     start_street: str = "",
+    selected_categories: Iterable[str] = ALL_CATEGORY_IDS,
+    geofence_data: bytes | None = None,
+    geofence_name: str = "",
     *,
     cache_dir: Path | str = DEFAULT_CACHE_DIR,
     progress: ProgressCallback | None = None,
-) -> RouteResult:
-    """Create a closed walk covering every edge in the main connected network."""
+) -> AdvancedRouteResult:
     place = " ".join(place.split())
     start_street = " ".join(start_street.split())
+    categories = tuple(sorted(set(selected_categories)))
+    invalid = set(categories) - set(ROAD_CATEGORIES)
     if len(place) < 3 or len(place) > 160:
-        raise RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
-    if len(start_street) > 120:
-        raise RouteError("The starting street name is too long.")
+        raise base.RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
+    if not categories:
+        raise base.RouteError("Select at least one road category.")
+    if invalid:
+        raise base.RouteError(f"Unknown road categories: {', '.join(sorted(invalid))}")
 
     cache_dir = Path(cache_dir)
-    key = _cache_key(place, start_street)
+    key = _cache_key(place, start_street, categories, geofence_data)
     result_path = cache_dir / "routes" / f"{key}.pkl"
     cached = _load_result(result_path)
     if cached:
-        _notify(progress, "Loaded the finished route from cache.")
+        _notify(progress, "Loaded the advanced route from cache.")
         return cached
 
-    lock = _request_lock(key)
+    lock = base._request_lock(f"advanced-{key}")
     if lock.locked():
-        _notify(progress, "Another visitor is already calculating this route; waiting for its cache…")
+        _notify(progress, "Another visitor is calculating these same options; waiting…")
     with lock:
-        # A previous waiter may have completed the route while this request was blocked.
         cached = _load_result(result_path)
         if cached:
-            _notify(progress, "Loaded the finished route from cache.")
+            _notify(progress, "Loaded the advanced route from cache.")
             return cached
-        return _generate_uncached_route(place, start_street, cache_dir, result_path, progress)
+
+        exclusion = parse_exclusion_geojson(geofence_data)
+        raw_graph = base._download_graph(place, cache_dir, progress)
+        graph, counts = _prepare_advanced_graph(raw_graph, set(categories), exclusion, progress)
+        if graph.number_of_nodes() > base.MAX_NODES or graph.number_of_edges() > base.MAX_EDGES:
+            raise base.RouteTooLargeError("The filtered network is too large for the free server.")
+        odd_nodes = sum(1 for _, degree in graph.degree() if degree % 2)
+        if odd_nodes > base.MAX_ODD_NODES:
+            raise base.RouteTooLargeError(
+                f"The filtered network has {odd_nodes:,} odd junctions. Select a smaller area or fewer road types."
+            )
+
+        start_node, actual_start = base._start_node(graph, start_street)
+        _notify(progress, f"Connecting {odd_nodes:,} odd junctions into a closed route…")
+        euler_graph = base._fast_eulerize(graph, progress)
+        _notify(progress, "Calculating traversals and route statistics…")
+        circuit = list(nx.eulerian_circuit(euler_graph, source=start_node, keys=True))
+        if not circuit:
+            raise base.RouteError("The generated advanced route was empty.")
+        result = _build_result(
+            place, start_street, actual_start, categories, geofence_name,
+            graph, circuit, euler_graph, counts,
+        )
+        try:
+            base._atomic_pickle(result_path, result)
+        except OSError:
+            pass
+        return result
