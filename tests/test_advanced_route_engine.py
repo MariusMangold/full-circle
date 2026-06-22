@@ -1,7 +1,8 @@
 import json
 
 import networkx as nx
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
+from shapely.prepared import prep
 
 import route_engine_old as base
 import route_engine as advanced
@@ -44,6 +45,20 @@ def test_inventory_reports_only_road_types_present_in_public_data():
     assert inventory.highway_counts == {"residential": 1, "footway": 1}
     assert inventory.public_segments == 2
     assert inventory.inaccessible_segments == 1
+
+
+def test_preview_status_matches_current_exclusions():
+    graph = nx.MultiGraph()
+    graph.add_node(1, x=8.0, y=49.0)
+    graph.add_node(2, x=8.01, y=49.0)
+    residential = {"highway": "residential"}
+    assert advanced._edge_filter_status(graph, 1, 2, residential, set(), None) == "included"
+    assert advanced._edge_filter_status(graph, 1, 2, residential, {"residential"}, None) == "road_type"
+    exclusion = prep(Polygon([(7.99, 48.99), (8.02, 48.99), (8.02, 49.01), (7.99, 49.01)]))
+    assert advanced._edge_filter_status(graph, 1, 2, residential, set(), exclusion) == "geofence"
+    assert advanced._edge_filter_status(
+        graph, 1, 2, {"highway": "service", "access": "private"}, set(), exclusion
+    ) == "inaccessible"
 
 
 def _statistics_graph():

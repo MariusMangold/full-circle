@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import folium
@@ -13,8 +14,11 @@ from route_engine_old import RouteError, RouteTooLargeError
 from route_engine import (
     ROAD_CATEGORIES,
     AdvancedRouteResult,
+    FilterPreview,
+    build_filter_preview,
     generate_route,
     inspect_place_roads,
+    load_place_graph,
 )
 
 
@@ -41,6 +45,89 @@ TRAVERSAL_COLORS = {1: "#22c55e", 2: "#f59e0b"}
 
 def traversal_color(count: int) -> str:
     return TRAVERSAL_COLORS.get(count, "#ef4444")
+
+
+@st.cache_resource(show_spinner=False)
+def cached_place_graph(place: str):
+    return load_place_graph(place)
+
+
+def exclusion_preview_map(preview: FilterPreview, geofence_data: bytes | None) -> folium.Map:
+    all_coordinates = [point for segment in preview.segments for point in segment.coordinates]
+    centre = all_coordinates[len(all_coordinates) // 2]
+    map_view = folium.Map(location=centre, zoom_start=13, control_scale=True, tiles=None)
+    folium.TileLayer(
+        "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="© OpenStreetMap contributors",
+        name="OpenStreetMap",
+        max_zoom=19,
+    ).add_to(map_view)
+
+    layer_settings = {
+        "included": ("Included roads", "#0891b2", 2, 0.65),
+        "road_type": ("Excluded road types", "#ef4444", 4, 0.95),
+        "geofence": ("Excluded by GeoJSON", "#a855f7", 4, 0.95),
+        "inaccessible": ("Private / inaccessible", "#64748b", 2, 0.45),
+    }
+    for status, (label, color, weight, opacity) in layer_settings.items():
+        features = []
+        for segment in preview.segments:
+            if segment.status != status:
+                continue
+            features.append({
+                "type": "Feature",
+                "properties": {
+                    "name": segment.name,
+                    "highway": segment.highway,
+                    "status": label,
+                },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[longitude, latitude] for latitude, longitude in segment.coordinates],
+                },
+            })
+        if features:
+            folium.GeoJson(
+                {"type": "FeatureCollection", "features": features},
+                name=f"{label} ({len(features):,})",
+                style_function=lambda _feature, color=color, weight=weight, opacity=opacity: {
+                    "color": color, "weight": weight, "opacity": opacity,
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=["name", "highway", "status"],
+                    aliases=["Street", "OSM type", "Status"],
+                    sticky=False,
+                ),
+            ).add_to(map_view)
+
+    if geofence_data:
+        geofence_payload = json.loads(geofence_data.decode("utf-8-sig"))
+        folium.GeoJson(
+            geofence_payload,
+            name="Uploaded exclusion polygon",
+            style_function=lambda _feature: {
+                "color": "#7e22ce", "weight": 2, "fillColor": "#c084fc", "fillOpacity": 0.18,
+            },
+        ).add_to(map_view)
+
+    bounds = [
+        [min(point[0] for point in all_coordinates), min(point[1] for point in all_coordinates)],
+        [max(point[0] for point in all_coordinates), max(point[1] for point in all_coordinates)],
+    ]
+    map_view.fit_bounds(bounds, padding=(24, 24))
+    folium.LayerControl(collapsed=False).add_to(map_view)
+    legend = """
+    <div style="position:fixed;bottom:28px;left:28px;z-index:9999;background:white;
+      padding:10px 14px;border-radius:8px;box-shadow:0 2px 10px #0003;font:14px sans-serif">
+      <b>Current exclusions</b><br>
+      <span style="color:#0891b2">━━</span> Included<br>
+      <span style="color:#ef4444">━━</span> Road type excluded<br>
+      <span style="color:#a855f7">━━</span> GeoJSON excluded<br>
+      <span style="color:#64748b">━━</span> Private / inaccessible
+    </div>
+    """
+    map_view.get_root().html.add_child(folium.Element(legend))
+    return map_view
 
 
 def route_map(result: AdvancedRouteResult) -> folium.Map:
@@ -165,48 +252,91 @@ if inventory:
         f"{highway} · {count:,} segments": highway for highway, count in sorted_highways
     }
 
-    with st.form("route-options", border=True):
-        route_tab, advanced_tab = st.tabs(["Route", "Advanced exclusions"])
-        with route_tab:
-            start_street = st.text_input(
-                "Starting street (optional)",
-                placeholder="Leave blank to start near the centre",
-            )
-            st.caption(f"The route will use the currently loaded network for **{inventory.place}**.")
+    route_tab, advanced_tab = st.tabs(["Route", "Advanced exclusions"])
+    with route_tab:
+        start_street = st.text_input(
+            "Starting street (optional)",
+            placeholder="Leave blank to start near the centre",
+        )
+        st.caption(f"The route will use the currently loaded network for **{inventory.place}**.")
 
-        with advanced_tab:
-            excluded_labels = st.multiselect(
-                "Road types to exclude",
-                options=list(highway_label_to_value),
-                default=[],
-                help=(
-                    "These are the exact highway tags detected in the loaded OpenStreetMap data. "
-                    "Selected types are removed before routing."
-                ),
-            )
-            st.dataframe(
-                pd.DataFrame([
-                    {"OSM highway type": highway, "Segments found": count}
-                    for highway, count in sorted_highways
-                ]),
-                hide_index=True,
+    with advanced_tab:
+        excluded_labels = st.multiselect(
+            "Road types to exclude",
+            options=list(highway_label_to_value),
+            default=[],
+            help=(
+                "These are the exact highway tags detected in the loaded OpenStreetMap data. "
+                "Selected types are removed before routing. The preview updates immediately."
+            ),
+        )
+        st.dataframe(
+            pd.DataFrame([
+                {"OSM highway type": highway, "Segments found": count}
+                for highway, count in sorted_highways
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        link_column, upload_column = st.columns([1, 2])
+        with link_column:
+            st.link_button(
+                "Create exclusion areas at geojson.io ↗",
+                "https://geojson.io/",
                 use_container_width=True,
             )
+        with upload_column:
             geofence_file = st.file_uploader(
-                "GeoJSON exclusion areas (optional)",
+                "Upload GeoJSON exclusion areas (optional)",
                 type=["geojson", "json"],
                 help=(
-                    "Draw Polygon or MultiPolygon areas at geojson.io and upload the exported file. "
-                    "Roads intersecting them are removed."
+                    "At geojson.io, draw Polygon or MultiPolygon areas, save as GeoJSON, "
+                    "then upload the exported file here. Roads intersecting them are removed."
                 ),
             )
-            st.caption("GeoJSON must use longitude/latitude (WGS84), as exported by geojson.io.")
-
-        submitted = st.form_submit_button("Generate route", type="primary", use_container_width=True)
+        st.caption("GeoJSON must use longitude/latitude (WGS84), as exported by geojson.io.")
 
     excluded_highways = tuple(highway_label_to_value[label] for label in excluded_labels)
     geofence_data = geofence_file.getvalue() if geofence_file else None
     geofence_name = geofence_file.name if geofence_file else ""
+
+    st.subheader("Current exclusion preview")
+    preview_valid = True
+    try:
+        raw_preview_graph = cached_place_graph(inventory.place)
+        preview = build_filter_preview(
+            raw_preview_graph,
+            inventory.place,
+            excluded_highways,
+            geofence_data,
+        )
+        preview_metrics = st.columns(4)
+        preview_metrics[0].metric("Included", f"{preview.status_counts.get('included', 0):,}")
+        preview_metrics[1].metric("Road type excluded", f"{preview.status_counts.get('road_type', 0):,}")
+        preview_metrics[2].metric("GeoJSON excluded", f"{preview.status_counts.get('geofence', 0):,}")
+        preview_metrics[3].metric("Private / inaccessible", f"{preview.status_counts.get('inaccessible', 0):,}")
+        components.html(
+            exclusion_preview_map(preview, geofence_data).get_root().render(),
+            height=620,
+            scrolling=False,
+        )
+        st.caption(
+            "Preview counts are unique displayed road segments. The final route uses the largest connected "
+            "component left after all exclusions. Use the layer control to hide or show each group."
+        )
+    except RouteError as exc:
+        preview_valid = False
+        st.error(f"The exclusion preview could not be built: {exc}")
+    except Exception as exc:
+        preview_valid = False
+        st.exception(exc)
+
+    submitted = st.button(
+        "Generate route",
+        type="primary",
+        use_container_width=True,
+        disabled=not preview_valid,
+    )
 
     if submitted:
         messages: list[str] = []

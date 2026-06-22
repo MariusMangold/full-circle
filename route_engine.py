@@ -116,6 +116,21 @@ class RoadInventory:
 
 
 @dataclass
+class PreviewSegment:
+    name: str
+    highway: str
+    status: str
+    coordinates: list[tuple[float, float]]
+
+
+@dataclass
+class FilterPreview:
+    place: str
+    segments: list[PreviewSegment]
+    status_counts: dict[str, int]
+
+
+@dataclass
 class AdvancedRouteResult:
     place: str
     requested_start: str
@@ -277,6 +292,19 @@ def inspect_place_roads(
     )
 
 
+def load_place_graph(
+    place: str,
+    *,
+    cache_dir: Path | str = DEFAULT_CACHE_DIR,
+    progress: ProgressCallback | None = None,
+):
+    """Load the cached raw graph used by the inventory and live preview."""
+    place = " ".join(place.split())
+    if len(place) < 3 or len(place) > 160:
+        raise base.RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
+    return base._download_graph(place, Path(cache_dir), progress)
+
+
 def _edge_geometry(graph, u, v, data: dict):
     geometry = data.get("geometry")
     if geometry is not None:
@@ -287,6 +315,36 @@ def _edge_geometry(graph, u, v, data: dict):
     ])
 
 
+def _edge_filter_status(graph, u, v, data: dict, excluded_highways: set[str], prepared_exclusion) -> str:
+    if _access_exclusion_reason(data):
+        return "inaccessible"
+    if _inventory_highway_values(data).intersection(excluded_highways):
+        return "road_type"
+    if prepared_exclusion and prepared_exclusion.intersects(_edge_geometry(graph, u, v, data)):
+        return "geofence"
+    return "included"
+
+
+def build_filter_preview(raw_graph, place: str, excluded_highways: Iterable[str] = (), geofence_data: bytes | None = None):
+    """Build unique map segments showing the effect of the current exclusions."""
+    excluded = {str(value).strip().casefold() for value in excluded_highways if str(value).strip()}
+    exclusion = parse_exclusion_geojson(geofence_data)
+    prepared_exclusion = prep(exclusion) if exclusion is not None else None
+    undirected = ox.convert.to_undirected(raw_graph.copy())
+    segments = []
+    counts = Counter()
+    for u, v, key, data in undirected.edges(keys=True, data=True):
+        status = _edge_filter_status(undirected, u, v, data, excluded, prepared_exclusion)
+        counts[status] += 1
+        segments.append(PreviewSegment(
+            name=_segment_name(data),
+            highway=", ".join(sorted(_inventory_highway_values(data))),
+            status=status,
+            coordinates=base._oriented_edge_coordinates(undirected, u, v, key),
+        ))
+    return FilterPreview(place=place, segments=segments, status_counts=dict(counts))
+
+
 def _prepare_advanced_graph(raw_graph, excluded_highways: set[str], exclusion, callback):
     _notify(callback, "Applying road-type exclusions, access rules, and exclusion areas…")
     graph = raw_graph.copy()
@@ -295,14 +353,13 @@ def _prepare_advanced_graph(raw_graph, excluded_highways: set[str], exclusion, c
     counts = Counter()
 
     for u, v, key, data in graph.edges(keys=True, data=True):
-        reason = None
-        if _access_exclusion_reason(data):
-            reason = "private"
-        elif _inventory_highway_values(data).intersection(excluded_highways):
-            reason = "road_filter"
-        elif prepared_exclusion and prepared_exclusion.intersects(_edge_geometry(graph, u, v, data)):
-            reason = "geofence"
-        if reason:
+        status = _edge_filter_status(graph, u, v, data, excluded_highways, prepared_exclusion)
+        reason = {
+            "inaccessible": "private",
+            "road_type": "road_filter",
+            "geofence": "geofence",
+        }.get(status)
+        if reason is not None:
             removals.append((u, v, key))
             counts[reason] += 1
 
