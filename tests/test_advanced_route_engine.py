@@ -27,6 +27,23 @@ def test_road_categories_follow_osm_highway_tags():
     assert advanced.edge_categories({"highway": "residential"}) == {"residential"}
     assert advanced.edge_categories({"highway": ["footway", "cycleway"]}) == {"footways", "cycleways"}
     assert advanced.edge_categories({"highway": "bridleway"}) == {"other"}
+    assert advanced._inventory_highway_values({}) == {"unknown"}
+
+
+def test_inventory_reports_only_road_types_present_in_public_data():
+    graph = nx.MultiGraph()
+    graph.add_edge(1, 2, highway="residential")
+    graph.add_edge(2, 3, highway="footway")
+    graph.add_edge(3, 4, highway="service", access="private")
+    original_download = base._download_graph
+    try:
+        base._download_graph = lambda *_args, **_kwargs: graph
+        inventory = advanced.inspect_place_roads("Test place")
+    finally:
+        base._download_graph = original_download
+    assert inventory.highway_counts == {"residential": 1, "footway": 1}
+    assert inventory.public_segments == 2
+    assert inventory.inaccessible_segments == 1
 
 
 def _statistics_graph():
@@ -52,10 +69,10 @@ def test_statistics_count_repeated_segments_and_export_csv():
     euler = base._fast_eulerize(graph)
     circuit = list(nx.eulerian_circuit(euler, source=1, keys=True))
     result = advanced._build_result(
-        "Test place", "", "Near the centre", ("footways", "residential"), "",
+        "Test place", "", "Near the centre", ("track",), "",
         graph, circuit, euler, {},
     )
     assert result.traversal_histogram[2] == 2
     assert result.distance_km == 0.44
+    assert result.excluded_highways == ("track",)
     assert "First Street" in result.statistics_csv()
-

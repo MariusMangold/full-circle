@@ -26,7 +26,7 @@ from shapely.prepared import prep
 import route_engine_old as base
 
 
-ADVANCED_CACHE_VERSION = 1
+ADVANCED_CACHE_VERSION = 2
 DEFAULT_CACHE_DIR = Path("cache/advanced")
 
 ROAD_CATEGORIES: dict[str, dict[str, object]] = {
@@ -100,11 +100,27 @@ class SegmentStat:
 
 
 @dataclass
+class RoadInventory:
+    place: str
+    category_counts: dict[str, int]
+    highway_counts: dict[str, int]
+    public_segments: int
+    inaccessible_segments: int
+
+    @property
+    def available_categories(self) -> tuple[str, ...]:
+        return tuple(
+            category_id for category_id in ROAD_CATEGORIES
+            if self.category_counts.get(category_id, 0) > 0
+        )
+
+
+@dataclass
 class AdvancedRouteResult:
     place: str
     requested_start: str
     actual_start: str
-    selected_categories: tuple[str, ...]
+    excluded_highways: tuple[str, ...]
     geofence_name: str
     coordinates: list[tuple[float, float]]
     segments: list[SegmentStat]
@@ -198,6 +214,11 @@ def _highway_values(data: dict) -> set[str]:
     return {str(value).casefold()} if value else set()
 
 
+def _inventory_highway_values(data: dict) -> set[str]:
+    """Return concrete OSM highway values, including a label for missing tags."""
+    return _highway_values(data) or {"unknown"}
+
+
 def edge_categories(data: dict) -> set[str]:
     highways = _highway_values(data)
     matched = {
@@ -210,6 +231,52 @@ def edge_categories(data: dict) -> set[str]:
     return matched
 
 
+def _access_exclusion_reason(data: dict) -> str | None:
+    denied_access = {"private", "no", "customers", "delivery"}
+    denied_service = {"parking_aisle", "driveway", "private", "alley", "parking", "yard"}
+    if denied_access.intersection(base._values(data.get("access"))):
+        return "private"
+    if denied_service.intersection(base._values(data.get("service"))):
+        return "private"
+    if {"yes", "true", "1"}.intersection(base._values(data.get("area"))):
+        return "private"
+    return None
+
+
+def inspect_place_roads(
+    place: str,
+    *,
+    cache_dir: Path | str = DEFAULT_CACHE_DIR,
+    progress: ProgressCallback | None = None,
+) -> RoadInventory:
+    """Download/cache a place, then summarize the public road tags present."""
+    place = " ".join(place.split())
+    if len(place) < 3 or len(place) > 160:
+        raise base.RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
+    graph = base._download_graph(place, Path(cache_dir), progress)
+    _notify(progress, "Inspecting the road types present in this place…")
+    category_counts = Counter()
+    highway_counts = Counter()
+    inaccessible = 0
+    public_segments = 0
+    for _u, _v, _key, data in graph.edges(keys=True, data=True):
+        if _access_exclusion_reason(data):
+            inaccessible += 1
+            continue
+        public_segments += 1
+        for category in edge_categories(data):
+            category_counts[category] += 1
+        for highway in _inventory_highway_values(data):
+            highway_counts[highway] += 1
+    return RoadInventory(
+        place=place,
+        category_counts=dict(category_counts),
+        highway_counts=dict(highway_counts),
+        public_segments=public_segments,
+        inaccessible_segments=inaccessible,
+    )
+
+
 def _edge_geometry(graph, u, v, data: dict):
     geometry = data.get("geometry")
     if geometry is not None:
@@ -220,24 +287,18 @@ def _edge_geometry(graph, u, v, data: dict):
     ])
 
 
-def _prepare_advanced_graph(raw_graph, selected_categories: set[str], exclusion, callback):
-    _notify(callback, "Applying road categories, access rules, and exclusion areas…")
+def _prepare_advanced_graph(raw_graph, excluded_highways: set[str], exclusion, callback):
+    _notify(callback, "Applying road-type exclusions, access rules, and exclusion areas…")
     graph = raw_graph.copy()
-    denied_access = {"private", "no", "customers", "delivery"}
-    denied_service = {"parking_aisle", "driveway", "private", "alley", "parking", "yard"}
     prepared_exclusion = prep(exclusion) if exclusion is not None else None
     removals = []
     counts = Counter()
 
     for u, v, key, data in graph.edges(keys=True, data=True):
         reason = None
-        if denied_access.intersection(base._values(data.get("access"))):
+        if _access_exclusion_reason(data):
             reason = "private"
-        elif denied_service.intersection(base._values(data.get("service"))):
-            reason = "private"
-        elif {"yes", "true", "1"}.intersection(base._values(data.get("area"))):
-            reason = "private"
-        elif not edge_categories(data).intersection(selected_categories):
+        elif _inventory_highway_values(data).intersection(excluded_highways):
             reason = "road_filter"
         elif prepared_exclusion and prepared_exclusion.intersects(_edge_geometry(graph, u, v, data)):
             reason = "geofence"
@@ -260,17 +321,17 @@ def _prepare_advanced_graph(raw_graph, selected_categories: set[str], exclusion,
 
     for index, (u, v, key, data) in enumerate(main.edges(keys=True, data=True)):
         data["_advanced_edge_id"] = f"edge-{index}"
-        categories = edge_categories(data).intersection(selected_categories)
+        categories = edge_categories(data)
         data["_advanced_category"] = sorted(categories)[0] if categories else "other"
     return main, counts
 
 
-def _cache_key(place: str, start: str, categories: tuple[str, ...], geofence_data: bytes | None) -> str:
+def _cache_key(place: str, start: str, excluded_highways: tuple[str, ...], geofence_data: bytes | None) -> str:
     payload = {
         "version": ADVANCED_CACHE_VERSION,
         "place": place.strip().casefold(),
         "start": start.strip().casefold(),
-        "categories": categories,
+        "excluded_highways": excluded_highways,
         "geofence": hashlib.sha256(geofence_data or b"").hexdigest(),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -297,7 +358,7 @@ def _segment_name(data: dict) -> str:
     return str(name) if name else "Unnamed way"
 
 
-def _build_result(place, start_street, actual_start, categories, geofence_name, graph, circuit, euler_graph, counts):
+def _build_result(place, start_street, actual_start, excluded_highways, geofence_name, graph, circuit, euler_graph, counts):
     traversal_counts = Counter()
     for u, v, key in circuit:
         data = euler_graph.get_edge_data(u, v, key) or {}
@@ -336,7 +397,7 @@ def _build_result(place, start_street, actual_start, categories, geofence_name, 
         place=place,
         requested_start=start_street,
         actual_start=actual_start,
-        selected_categories=categories,
+        excluded_highways=excluded_highways,
         geofence_name=geofence_name,
         coordinates=coordinates,
         segments=segments,
@@ -354,10 +415,10 @@ def _build_result(place, start_street, actual_start, categories, geofence_name, 
     )
 
 
-def generate_advanced_route(
+def generate_route(
     place: str,
     start_street: str = "",
-    selected_categories: Iterable[str] = ALL_CATEGORY_IDS,
+    excluded_highways: Iterable[str] = (),
     geofence_data: bytes | None = None,
     geofence_name: str = "",
     *,
@@ -366,17 +427,12 @@ def generate_advanced_route(
 ) -> AdvancedRouteResult:
     place = " ".join(place.split())
     start_street = " ".join(start_street.split())
-    categories = tuple(sorted(set(selected_categories)))
-    invalid = set(categories) - set(ROAD_CATEGORIES)
+    excluded = tuple(sorted({str(value).strip().casefold() for value in excluded_highways if str(value).strip()}))
     if len(place) < 3 or len(place) > 160:
         raise base.RouteError("Enter a city, municipality, or district name between 3 and 160 characters.")
-    if not categories:
-        raise base.RouteError("Select at least one road category.")
-    if invalid:
-        raise base.RouteError(f"Unknown road categories: {', '.join(sorted(invalid))}")
 
     cache_dir = Path(cache_dir)
-    key = _cache_key(place, start_street, categories, geofence_data)
+    key = _cache_key(place, start_street, excluded, geofence_data)
     result_path = cache_dir / "routes" / f"{key}.pkl"
     cached = _load_result(result_path)
     if cached:
@@ -394,7 +450,19 @@ def generate_advanced_route(
 
         exclusion = parse_exclusion_geojson(geofence_data)
         raw_graph = base._download_graph(place, cache_dir, progress)
-        graph, counts = _prepare_advanced_graph(raw_graph, set(categories), exclusion, progress)
+        available_highways = {
+            highway
+            for _u, _v, _key, data in raw_graph.edges(keys=True, data=True)
+            if not _access_exclusion_reason(data)
+            for highway in _inventory_highway_values(data)
+        }
+        unknown_exclusions = set(excluded) - available_highways
+        if unknown_exclusions:
+            raise base.RouteError(
+                "These excluded road types are not present in the loaded data: "
+                + ", ".join(sorted(unknown_exclusions))
+            )
+        graph, counts = _prepare_advanced_graph(raw_graph, set(excluded), exclusion, progress)
         if graph.number_of_nodes() > base.MAX_NODES or graph.number_of_edges() > base.MAX_EDGES:
             raise base.RouteTooLargeError("The filtered network is too large for the free server.")
         odd_nodes = sum(1 for _, degree in graph.degree() if degree % 2)
@@ -411,7 +479,7 @@ def generate_advanced_route(
         if not circuit:
             raise base.RouteError("The generated advanced route was empty.")
         result = _build_result(
-            place, start_street, actual_start, categories, geofence_name,
+            place, start_street, actual_start, excluded, geofence_name,
             graph, circuit, euler_graph, counts,
         )
         try:
@@ -419,3 +487,7 @@ def generate_advanced_route(
         except OSError:
             pass
         return result
+
+
+# Compatibility for bookmarks or older callers of the experimental version.
+generate_advanced_route = generate_route

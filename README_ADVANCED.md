@@ -1,11 +1,14 @@
 # Every Single Street · Advanced
 
-This is a second, isolated Streamlit app. The stable `app.py` and
-`route_engine.py` remain the deployment entry point for the original version.
+This is the active advanced Streamlit app in `app.py` and `route_engine.py`.
+The previous stable version is preserved in `appold.py` and
+`route_engine_old.py`.
 
 ## Features
 
-- Select OpenStreetMap road categories to include in the route.
+- Load a city first and inspect the exact OpenStreetMap `highway=*` road types
+  present in its walking network.
+- Select detected road types to exclude from the route.
 - Upload Polygon or MultiPolygon GeoJSON exclusion areas, including exports from
   [geojson.io](https://geojson.io/).
 - View an interactive traversal-frequency map:
@@ -24,16 +27,15 @@ are applied.
 Install the same dependencies as the stable app, then run:
 
 ```powershell
-streamlit run app_advanced.py
+streamlit run app.py
 ```
 
-## Deploy beside the stable app
+## Deploy
 
-In Streamlit Community Cloud, create a **second app** from the same GitHub
-repository and branch. Set its main file path to:
+In Streamlit Community Cloud, set the main file path to:
 
 ```text
-app_advanced.py
+app.py
 ```
 
-This produces a second public URL and does not change the stable deployment.
+To deploy the preserved old version separately, use `appold.py` as the main file.
