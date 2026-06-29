@@ -29,7 +29,7 @@ import route_engine_old as base
 
 ADVANCED_CACHE_VERSION = 3
 DEFAULT_CACHE_DIR = Path("cache/advanced")
-MAX_EXACT_ODD_NODES = int(os.environ.get("MAX_EXACT_ODD_NODES", "900"))
+MAX_EXACT_ODD_NODES = 50000
 
 ROAD_CATEGORIES: dict[str, dict[str, object]] = {
     "main_roads": {
