@@ -601,7 +601,7 @@ def generate_route(
         if graph.number_of_nodes() > base.MAX_NODES or graph.number_of_edges() > base.MAX_EDGES:
             raise base.RouteTooLargeError("The filtered network is too large for the free server.")
         odd_nodes = sum(1 for _, degree in graph.degree() if degree % 2)
-        if odd_nodes > base.MAX_ODD_NODES:
+        if odd_nodes > 10000:
             raise base.RouteTooLargeError(
                 f"The filtered network has {odd_nodes:,} odd junctions. Select a smaller area or fewer road types."
             )
